@@ -1,4 +1,4 @@
-//! DDNS Firewall Synchronizer v2.2
+//! DDNS Firewall Synchronizer v2.2.1
 //!
 //! Ultra-lightweight, production-grade DDNS-based iptables firewall manager.
 //! Designed for 24/7 critical servers - zero SSH access loss guaranteed.
@@ -13,6 +13,8 @@
 //! - Memory bounded (max 100 rules)
 //! - Reboot/crash safe with automatic recovery
 //! - Idempotent: safe to run unlimited times
+//! - File locking prevents concurrent execution
+//! - Strict permissions prevent privilege escalation
 
 use std::collections::HashSet;
 use std::env;
@@ -20,6 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -47,6 +50,8 @@ const IPTABLES_PATHS: &[&str] = &[
     "/sbin/iptables",
     "/usr/bin/iptables",
 ];
+
+const LOCK_PATH: &str = "/etc/ddnsfw/.lock";
 
 // ============================================================================
 // Cache Structure (Crash Recovery)
@@ -206,6 +211,55 @@ fn parse_ip_port(s: &str) -> Option<(Ipv4Addr, u16)> {
 fn exit_err(msg: &str) -> ! {
     eprintln!("[ddnsfw] ERROR: {}", msg);
     std::process::exit(1);
+}
+
+// ============================================================================
+// File Locking (Prevents Concurrent Execution)
+// ============================================================================
+
+/// Acquires an exclusive lock on the lock file.
+/// Returns the lock file handle (must be kept alive during operation).
+/// If another instance is running, waits up to 30 seconds then exits.
+fn acquire_lock() -> Option<File> {
+    // Create lock file if it doesn't exist
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(LOCK_PATH)
+        .ok()?;
+
+    // Try to acquire exclusive lock (non-blocking first)
+    let fd = lock_file.as_raw_fd();
+    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+
+    if result == 0 {
+        // Lock acquired immediately
+        return Some(lock_file);
+    }
+
+    // Another instance is running, wait with timeout
+    println!("[ddnsfw] Another instance is running, waiting...");
+
+    // Try blocking lock with timeout using a separate thread
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (tx, rx) = mpsc::channel();
+    let fd_copy = fd;
+
+    thread::spawn(move || {
+        let result = unsafe { libc::flock(fd_copy, libc::LOCK_EX) };
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(0) => Some(lock_file),
+        _ => {
+            eprintln!("[ddnsfw] ERROR: Timeout waiting for lock (another instance running too long)");
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -474,6 +528,16 @@ fn recover_from_crash(iptables_bin: &str, cache: &mut Cache) {
 // ============================================================================
 
 fn sync_firewall() {
+    // Acquire exclusive lock to prevent concurrent execution
+    let _lock = match acquire_lock() {
+        Some(lock) => lock,
+        None => {
+            eprintln!("[ddnsfw] ERROR: Could not acquire lock");
+            return;
+        }
+    };
+    // Lock is held until _lock goes out of scope
+
     let Some(iptables_bin) = find_iptables() else {
         eprintln!("[ddnsfw] ERROR: iptables not found");
         return;
@@ -705,23 +769,30 @@ fn interactive_setup() -> Vec<DdnsEntry> {
 fn install(entries: Vec<DdnsEntry>) {
     println!("\nInstalling...\n");
 
-    print!("  [1/7] Creating directory... ");
+    print!("  [1/8] Creating directory... ");
     if fs::create_dir_all(INSTALL_DIR).is_err() {
         exit_err("Failed to create directory");
     }
+    // Set directory permissions to 700 (rwx------) - only root can access
+    if fs::set_permissions(INSTALL_DIR, fs::Permissions::from_mode(0o700)).is_err() {
+        exit_err("Failed to set directory permissions");
+    }
     println!("OK");
 
-    print!("  [2/7] Copying binary... ");
+    print!("  [2/8] Copying binary... ");
     let exe = env::current_exe().unwrap_or_else(|_| exit_err("Cannot get exe path"));
     if exe.to_string_lossy() != BINARY_PATH {
         if fs::copy(&exe, BINARY_PATH).is_err() {
             exit_err("Failed to copy binary");
         }
-        let _ = fs::set_permissions(BINARY_PATH, fs::Permissions::from_mode(0o700));
+    }
+    // Set binary permissions to 700 (rwx------) - only root can execute
+    if fs::set_permissions(BINARY_PATH, fs::Permissions::from_mode(0o700)).is_err() {
+        exit_err("Failed to set binary permissions");
     }
     println!("OK");
 
-    print!("  [3/7] Creating config... ");
+    print!("  [3/8] Creating config... ");
     let mut config = String::from(
         "# DDNS Firewall Configuration\n\
          # Format: hostname:port\n\n",
@@ -740,12 +811,25 @@ fn install(entries: Vec<DdnsEntry>) {
     }
     println!("OK");
 
-    print!("  [4/7] Initializing cache... ");
+    print!("  [4/8] Initializing cache... ");
     let cache = Cache::new();
     cache.save();
     println!("OK");
 
-    print!("  [5/7] Creating systemd service... ");
+    print!("  [5/8] Creating lock file... ");
+    // Create lock file with 600 permissions
+    if OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(LOCK_PATH)
+        .is_err()
+    {
+        exit_err("Failed to create lock file");
+    }
+    println!("OK");
+
+    print!("  [6/8] Creating systemd service... ");
     let service = r#"[Unit]
 Description=DDNS Firewall Synchronizer
 After=network-online.target
@@ -767,7 +851,7 @@ WantedBy=multi-user.target
     }
     println!("OK");
 
-    print!("  [6/7] Creating systemd timer... ");
+    print!("  [7/8] Creating systemd timer... ");
     let timer = r#"[Unit]
 Description=DDNS Firewall Synchronizer Timer
 
@@ -785,7 +869,7 @@ WantedBy=timers.target
     }
     println!("OK");
 
-    print!("  [7/7] Enabling service... ");
+    print!("  [8/8] Enabling service... ");
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
     let _ = Command::new("systemctl").args(["enable", "ddnsfw.timer"]).output();
     let _ = Command::new("systemctl").args(["start", "ddnsfw.timer"]).output();
